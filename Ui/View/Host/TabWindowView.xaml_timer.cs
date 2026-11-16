@@ -271,9 +271,9 @@ namespace _1RM.View.Host
                 return;
             if (IoC.Get<ConfigurationService>().General.TabWindowSetFocusToLocalDesktopOnMouseLeaveRdpWindow)
             {
-                bool isMousePressed = System.Windows.Forms.Control.MouseButtons == System.Windows.Forms.Control.MouseButtons.Left
-                                      || System.Windows.Forms.Control.MouseButtons == System.Windows.Forms.MouseButtons.Right
-                                      || System.Windows.Forms.Control.MouseButtons == System.Windows.Forms.MouseButtons.Middle;
+                bool isMousePressed = System.Windows.Forms.Control.MouseButtons == MouseButtons.Left
+                                      || System.Windows.Forms.Control.MouseButtons == MouseButtons.Right
+                                      || System.Windows.Forms.Control.MouseButtons == MouseButtons.Middle;
                 var nowActivatedWindowHandle = GetForegroundWindow();
                 IntPtr rdpHandle;
                 if (Vm?.SelectedItem?.Content is AxMsRdpClient09Host)
