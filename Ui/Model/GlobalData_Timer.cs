@@ -8,7 +8,8 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
-using System.Timers;
+using System.Threading;
+using Timer = System.Timers.Timer;
 
 namespace _1RM.Model
 {
@@ -16,6 +17,7 @@ namespace _1RM.Model
     {
         private readonly Timer _timer = new Timer(1000);
         private bool _timerStopFlag = false;
+        private int _timerBusy = 0;
 
         private void InitTimer()
         {
@@ -31,6 +33,7 @@ namespace _1RM.Model
                 _timerStopFlag = true;
             }
         }
+
         public void StartTick()
         {
             CheckUpdateTime = DateTime.Now.AddSeconds(_configurationService.DatabaseCheckPeriod);
@@ -44,54 +47,32 @@ namespace _1RM.Model
             }
         }
 
-        /// <summary>
-        /// return time string like 1d 2h 3m 4s
-        /// </summary>
-        /// <param name="seconds"></param>
-        /// <returns></returns>
         private static string GetTime(long seconds)
         {
             var sb = new StringBuilder();
-            if (seconds > 86400)
-            {
-                sb.Append($"{seconds / 86400}d");
-                seconds %= 86400;
-            }
-
-            if (seconds > 3600)
-            {
-                sb.Append($"{seconds / 3600}h");
-                seconds %= 3600;
-            }
-
-            if (seconds > 60)
-            {
-                sb.Append($"{seconds / 60}m");
-                seconds %= 60;
-            }
-
-            if (seconds > 0)
-            {
-                sb.Append($"{seconds}s");
-            }
+            if (seconds > 86400) { sb.Append($"{seconds / 86400}d"); seconds %= 86400; }
+            if (seconds > 3600) { sb.Append($"{seconds / 3600}h"); seconds %= 3600; }
+            if (seconds > 60) { sb.Append($"{seconds / 60}m"); seconds %= 60; }
+            if (seconds > 0) { sb.Append($"{seconds}s"); }
             return sb.ToString();
         }
 
         public DateTime CheckUpdateTime;
         private void TimerOnElapsed()
         {
+            if (Interlocked.CompareExchange(ref _timerBusy, 1, 0) != 0)
+                return;
+
             try
             {
-                if (_sourceService == null)
+                if (_sourceService == null || _timerStopFlag)
                     return;
 
                 var mainWindowViewModel = IoC.TryGet<MainWindowViewModel>();
                 var listPageViewModel = IoC.TryGet<ServerListPageViewModel>();
                 var launcherWindowViewModel = IoC.TryGet<LauncherWindowViewModel>();
 
-                if (mainWindowViewModel == null
-                   || listPageViewModel == null
-                   || launcherWindowViewModel == null)
+                if (mainWindowViewModel == null || listPageViewModel == null || launcherWindowViewModel == null)
                     return;
 
                 var ds = new List<DataSourceBase>();
@@ -99,9 +80,9 @@ namespace _1RM.Model
                     ds.Add(_sourceService.LocalDataSource);
                 ds.AddRange(_sourceService.AdditionalSources.Values);
 
-                // do not reload when any selected / launcher is shown / editor view is show
                 if (listPageViewModel.VmServerList.Any(x => x.IsSelected)
-                    || launcherWindowViewModel?.View?.IsVisible == true)
+                    || launcherWindowViewModel?.View?.IsVisible == true
+                    || LauncherWindowViewModel.IsLauncherOpenOrOpening)
                 {
                     var pause = IoC.Translate("Pause");
                     foreach (var s in ds)
@@ -111,7 +92,6 @@ namespace _1RM.Model
                     return;
                 }
 
-
                 long checkUpdateEtc = 0;
                 if (CheckUpdateTime > DateTime.Now)
                 {
@@ -119,7 +99,6 @@ namespace _1RM.Model
                     checkUpdateEtc = (long)ts.TotalSeconds;
                 }
                 long minReconnectEtc = int.MaxValue;
-
 
                 var needReconnect = new List<DataSourceBase>();
                 foreach (var s in ds.Where(x => x.Status != EnumDatabaseStatus.OK))
@@ -136,8 +115,6 @@ namespace _1RM.Model
                 }
 
                 var minEtc = Math.Min(checkUpdateEtc, minReconnectEtc);
-
-
                 var msg = minEtc > 0 ? $"{IoC.Translate("Next update check")} {GetTime(minEtc)}" : IoC.Translate("Updating");
                 var msgNextReconnect = IoC.Translate("Next auto reconnect");
                 var msgReconnecting = IoC.Translate("Reconnecting");
@@ -162,31 +139,20 @@ namespace _1RM.Model
                 }
 
                 if (minEtc > 0 && minReconnectEtc > 0)
-                {
                     return;
-                }
 
-                // reconnect 
                 foreach (var dataSource in needReconnect.Where(x => x.ReconnectTime < DateTime.Now))
                 {
-                    if (dataSource.Database_SelfCheck().Status == EnumDatabaseStatus.OK)
+                    if (_timerStopFlag) return;
+                    if (dataSource.Database_SelfCheck(10).Status == EnumDatabaseStatus.OK)
                     {
                         minEtc = 0;
                     }
                 }
 
-                if (minEtc == 0)
+                if (minEtc == 0 && !_timerStopFlag)
                 {
-                    if (ReloadAll()) // reload data in the timer
-                    {
-                        SimpleLogHelper.Debug("check database update - reload data by timer " + _timer.GetHashCode());
-                    }
-                    else
-                    {
-                        SimpleLogHelper.Debug("check database update - no need reload by timer " + _timer.GetHashCode());
-                    }
-
-                    // TODO: reload credentials
+                    ReloadAll();
                 }
 
                 System.Diagnostics.Process.GetCurrentProcess().MinWorkingSet = System.Diagnostics.Process.GetCurrentProcess().MinWorkingSet;
@@ -195,10 +161,11 @@ namespace _1RM.Model
             catch (Exception ex)
             {
                 UnifyTracing.Error(ex);
-                throw;
+                SimpleLogHelper.Warning(ex);
             }
             finally
             {
+                Interlocked.Exchange(ref _timerBusy, 0);
                 lock (this)
                 {
                     if (_timerStopFlag == false && _configurationService.DatabaseCheckPeriod > 0)

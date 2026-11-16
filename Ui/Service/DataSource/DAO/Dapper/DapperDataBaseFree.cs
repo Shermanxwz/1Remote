@@ -1,13 +1,15 @@
-﻿using System.Collections.Generic;
-using _1RM.Model.Protocol;
+﻿using System;
+using System.Collections.Generic;
+using System.Data.SQLite;
 using _1RM.Model.Protocol.Base;
-using Dapper;
-using Newtonsoft.Json;
+using MySql.Data.MySqlClient;
+using Npgsql;
 
 namespace _1RM.Service.DataSource.DAO.Dapper
 {
     /// <summary>
-    /// DapperDb no occupation version
+    /// Thread-safe, pool-friendly DapperDatabase implementation that closes/disposes connections
+    /// after each logical operation and automatically clears broken pooled sockets on transient errors.
     /// </summary>
     public sealed class DapperDatabaseFree : DapperDatabase
     {
@@ -15,201 +17,140 @@ namespace _1RM.Service.DataSource.DAO.Dapper
         {
         }
 
-        /// <inheritdoc />
-        public override Result InitTables()
+        public override void CloseConnection()
         {
             lock (this)
             {
-                OpenConnection();
-                var ret = base.InitTables();
+                try { _dbConnection?.Close(); } catch { /* ignore */ }
+                if (DatabaseType == DatabaseType.Sqlite && _dbConnection is SQLiteConnection sqliteConn)
+                {
+                    try { SQLiteConnection.ClearPool(sqliteConn); } catch { /* ignore */ }
+                }
+                try { _dbConnection?.Dispose(); } catch { /* ignore */ }
+                _dbConnection = null;
+            }
+        }
+
+        private void ClearStalePoolAndClose()
+        {
+            lock (this)
+            {
+                try
+                {
+                    if (_dbConnection is MySqlConnection mysqlConn)
+                        MySqlConnection.ClearPool(mysqlConn);
+                    else if (_dbConnection is NpgsqlConnection npgsqlConn)
+                        NpgsqlConnection.ClearPool(npgsqlConn);
+                }
+                catch
+                {
+                    // ignore pool cleanup failures
+                }
+                CloseConnection();
+            }
+        }
+
+        private T ExecuteReadOrIdempotentWithRetry<T>(Func<T> op, bool closeInEnd = true) where T : Result
+        {
+            lock (this)
+            {
+                var open = OpenConnection();
+                if (!open.IsSuccess && DatabaseType is DatabaseType.MySql or DatabaseType.PostgreSQL)
+                {
+                    ClearStalePoolAndClose();
+                    open = OpenConnection();
+                }
+
+                var ret = op();
+                if (!ret.IsSuccess && DatabaseType is DatabaseType.MySql or DatabaseType.PostgreSQL)
+                {
+                    ClearStalePoolAndClose();
+                    if (OpenConnection().IsSuccess)
+                    {
+                        ret = op();
+                    }
+                }
+
+                if (closeInEnd)
+                    CloseConnection();
+                return ret;
+            }
+        }
+
+        private T ExecuteMutationSafe<T>(Func<T> op) where T : Result
+        {
+            lock (this)
+            {
+                var open = OpenConnection();
+                if (!open.IsSuccess && DatabaseType is DatabaseType.MySql or DatabaseType.PostgreSQL)
+                {
+                    ClearStalePoolAndClose();
+                    OpenConnection();
+                }
+
+                var ret = op();
+                if (!ret.IsSuccess && !IsConnected() && DatabaseType is DatabaseType.MySql or DatabaseType.PostgreSQL)
+                {
+                    ClearStalePoolAndClose();
+                    if (OpenConnection().IsSuccess)
+                    {
+                        ret = op();
+                    }
+                }
+
                 CloseConnection();
                 return ret;
             }
         }
 
-        /// <inheritdoc />
-        public override ResultSelects<ProtocolBase> GetServers()
-        {
-            lock (this)
-            {
-                OpenConnection();
-                var ret = base.GetServers();
-                CloseConnection();
-                return ret;
-            }
-        }
+        public override Result InitTables() => ExecuteReadOrIdempotentWithRetry(() => base.InitTables());
 
-        /// <inheritdoc />
+        public override ResultSelects<ProtocolBase> GetServers() => ExecuteReadOrIdempotentWithRetry(() => base.GetServers());
+
         public override Result AddServer(ref ProtocolBase protocolBase)
         {
             lock (this)
             {
-                OpenConnection();
-                var ret = base.AddServer(ref protocolBase);
-                CloseConnection();
+                var tmp = protocolBase;
+                var ret = ExecuteMutationSafe(() => base.AddServer(ref tmp));
+                protocolBase = tmp;
                 return ret;
             }
         }
 
-        /// <inheritdoc />
-        public override Result AddServer(IEnumerable<ProtocolBase> protocolBases)
-        {
-            lock (this)
-            {
-                OpenConnection();
-                var ret = base.AddServer(protocolBases);
-                CloseConnection();
-                return ret;
-            }
-        }
+        public override Result AddServer(IEnumerable<ProtocolBase> protocolBases) => ExecuteMutationSafe(() => base.AddServer(protocolBases));
 
-        /// <inheritdoc />
-        public override Result UpdateServer(ProtocolBase server)
-        {
-            lock (this)
-            {
-                OpenConnection();
-                var ret = base.UpdateServer(server);
-                CloseConnection();
-                return ret;
-            }
-        }
+        public override Result UpdateServer(ProtocolBase server) => ExecuteReadOrIdempotentWithRetry(() => base.UpdateServer(server));
 
-        /// <inheritdoc />
-        public override Result UpdateServer(IEnumerable<ProtocolBase> servers)
-        {
-            lock (this)
-            {
-                OpenConnection();
-                var ret = base.UpdateServer(servers);
-                CloseConnection();
-                return ret;
-            }
-        }
+        public override Result UpdateServer(IEnumerable<ProtocolBase> servers) => ExecuteReadOrIdempotentWithRetry(() => base.UpdateServer(servers));
 
+        public override Result DeleteServer(IEnumerable<string> ids) => ExecuteMutationSafe(() => base.DeleteServer(ids));
 
+        public override ResultString GetConfig(string key, bool closeInEnd = true) => ExecuteReadOrIdempotentWithRetry(() => base.GetConfig(key), closeInEnd);
 
-        /// <inheritdoc />
-        public override Result DeleteServer(IEnumerable<string> ids)
-        {
-            lock (this)
-            {
-                OpenConnection();
-                var ret = base.DeleteServer(ids);
-                CloseConnection();
-                return ret;
-            }
-        }
+        public override Result SetConfig(string key, string? value, bool closeInEnd = true) => ExecuteReadOrIdempotentWithRetry(() => base.SetConfig(key, value), closeInEnd);
 
+        public override Result SetTableUpdateTimestamp(string dataType, long time = -1, bool closeInEnd = true) => ExecuteReadOrIdempotentWithRetry(() => base.SetTableUpdateTimestamp(dataType, time), closeInEnd);
 
-        /// <inheritdoc />
-        public override ResultString GetConfig(string key, bool closeInEnd = true)
-        {
-            lock (this)
-            {
-                OpenConnection();
-                var ret = base.GetConfig(key);
-                if (closeInEnd)
-                    CloseConnection();
-                return ret;
-            }
-        }
+        public override ResultLong GetTableUpdateTimestamp(string tableName, bool closeInEnd = true) => ExecuteReadOrIdempotentWithRetry(() => base.GetTableUpdateTimestamp(tableName), closeInEnd);
 
-        /// <inheritdoc />
-        public override Result SetConfig(string key, string? value, bool closeInEnd = true)
-        {
-            lock (this)
-            {
-                OpenConnection();
-                var ret = base.SetConfig(key, value);
-                if (closeInEnd)
-                    CloseConnection();
-                return ret;
-            }
-        }
-
-
-        public override Result SetTableUpdateTimestamp(string dataType, long time = -1, bool closeInEnd = true)
-        {
-            lock (this)
-            {
-                OpenConnection();
-                var ret = base.SetTableUpdateTimestamp(dataType, time);
-                if (closeInEnd)
-                    CloseConnection();
-                return ret;
-            }
-        }
-
-        public override ResultLong GetTableUpdateTimestamp(string tableName, bool closeInEnd = true)
-        {
-            lock (this)
-            {
-                OpenConnection();
-                var ret = base.GetTableUpdateTimestamp(tableName);
-                if (closeInEnd)
-                    CloseConnection();
-                return ret;
-            }
-        }
-
-
-
-        public override ResultSelects<Credential> GetCredentials(bool closeInEnd = true)
-        {
-            lock (this)
-            {
-                OpenConnection();
-                var ret = base.GetCredentials();
-                if (closeInEnd)
-                    CloseConnection();
-                return ret;
-            }
-        }
+        public override ResultSelects<Credential> GetCredentials(bool closeInEnd = true) => ExecuteReadOrIdempotentWithRetry(() => base.GetCredentials(), closeInEnd);
 
         public override Result AddCredential(ref Credential credential)
         {
             lock (this)
             {
-                OpenConnection();
-                var ret = base.AddCredential(ref credential);
-                CloseConnection();
+                var tmp = credential;
+                var ret = ExecuteMutationSafe(() => base.AddCredential(ref tmp));
+                credential = tmp;
                 return ret;
             }
         }
 
+        public override Result UpdateCredential(Credential credential, List<ProtocolBaseWithAddressPortUserPwd>? relatedProtocols = null) =>
+            ExecuteMutationSafe(() => base.UpdateCredential(credential, relatedProtocols));
 
-        public override Result UpdateCredential(Credential credential, List<ProtocolBaseWithAddressPortUserPwd>? relatedProtocols = null)
-        {
-            lock (this)
-            {
-                OpenConnection();
-                var ret = base.UpdateCredential(credential, relatedProtocols);
-                CloseConnection();
-                return ret;
-            }
-        }
-
-        //public override Result UpdateCredential(IEnumerable<Credential> credentials)
-        //{
-        //    lock (this)
-        //    {
-        //        OpenConnection();
-        //        var ret = base.UpdateCredential(credentials);
-        //        CloseConnection();
-        //        return ret;
-        //    }
-        //}
-
-        public override Result DeleteCredential(IEnumerable<string> names, List<ProtocolBaseWithAddressPortUserPwd>? relatedProtocols = null)
-        {
-            lock (this)
-            {
-                OpenConnection();
-                var ret = base.DeleteCredential(names);
-                CloseConnection();
-                return ret;
-            }
-        }
+        public override Result DeleteCredential(IEnumerable<string> names, List<ProtocolBaseWithAddressPortUserPwd>? relatedProtocols = null) =>
+            ExecuteMutationSafe(() => base.DeleteCredential(names, relatedProtocols));
     }
 }

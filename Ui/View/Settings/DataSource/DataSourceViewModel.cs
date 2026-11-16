@@ -47,7 +47,6 @@ namespace _1RM.View.Settings.DataSource
             }
         }
 
-
         public SqliteSource LocalSource { get; }
 
         private ObservableCollection<DataSourceBase> _sourceConfigs = new ObservableCollection<DataSourceBase>();
@@ -57,8 +56,6 @@ namespace _1RM.View.Settings.DataSource
             set => SetAndNotifyIfChanged(ref _sourceConfigs, value);
         }
 
-
-
         private RelayCommand? _cmdAdd;
         public RelayCommand CmdAdd
         {
@@ -66,10 +63,7 @@ namespace _1RM.View.Settings.DataSource
             {
                 return _cmdAdd ??= new RelayCommand((o) =>
                 {
-                    if (o is not string type)
-                    {
-                        return;
-                    }
+                    if (o is not string type) return;
 
                     DataSourceBase? dataSource = null;
                     switch (type.ToLower())
@@ -107,9 +101,11 @@ namespace _1RM.View.Settings.DataSource
                     _configurationService.Save();
                     Task.Factory.StartNew(() =>
                     {
+                        var globalData = IoC.TryGet<GlobalData>();
+                        globalData?.StopTick();
                         try
                         {
-                            var ret = _dataSourceService.AddOrUpdateDataSource(dataSource);
+                            var ret = _dataSourceService.AddOrUpdateDataSource(dataSource, connectTimeOutSeconds: 10);
                             if (ret.Status != EnumDatabaseStatus.OK)
                             {
                                 MessageBoxHelper.ErrorAlert(ret.GetErrorMessage);
@@ -117,15 +113,13 @@ namespace _1RM.View.Settings.DataSource
                         }
                         finally
                         {
+                            globalData?.StartTick();
                             MaskLayerController.HideMask(IoC.Get<MainWindowViewModel>());
                         }
                     });
-                }, _ =>
-                        IoPermissionHelper.HasWritePermissionOnFile(AppPathHelper.Instance.ProfileAdditionalDataSourceJsonPath)
-                    );
+                }, _ => IoPermissionHelper.HasWritePermissionOnFile(AppPathHelper.Instance.ProfileAdditionalDataSourceJsonPath));
             }
         }
-
 
         private RelayCommand? _cmdEdit;
         public RelayCommand CmdEdit
@@ -150,9 +144,11 @@ namespace _1RM.View.Settings.DataSource
                     _configurationService.Save();
                     Task.Factory.StartNew(() =>
                     {
+                        var globalData = IoC.TryGet<GlobalData>();
+                        globalData?.StopTick();
                         try
                         {
-                            var ret = _dataSourceService.AddOrUpdateDataSource(dataSource);
+                            var ret = _dataSourceService.AddOrUpdateDataSource(dataSource, connectTimeOutSeconds: 10);
                             if (ret.Status != EnumDatabaseStatus.OK)
                             {
                                 MessageBoxHelper.ErrorAlert(ret.GetErrorMessage);
@@ -160,13 +156,13 @@ namespace _1RM.View.Settings.DataSource
                         }
                         finally
                         {
+                            globalData?.StartTick();
                             MaskLayerController.HideMask(IoC.Get<MainWindowViewModel>());
                         }
                     });
                 });
             }
         }
-        
 
         private RelayCommand? _cmdDelete;
         public RelayCommand CmdDelete
@@ -191,11 +187,9 @@ namespace _1RM.View.Settings.DataSource
                             });
                         }
                     }
-                }, _ =>
-                    IoPermissionHelper.HasWritePermissionOnFile(AppPathHelper.Instance.ProfileAdditionalDataSourceJsonPath));
+                }, _ => IoPermissionHelper.HasWritePermissionOnFile(AppPathHelper.Instance.ProfileAdditionalDataSourceJsonPath));
             }
         }
-        
 
         private RelayCommand? _cmdRefreshDataSource;
         public RelayCommand CmdRefreshDataSource
@@ -207,20 +201,13 @@ namespace _1RM.View.Settings.DataSource
                     if (o is DataSourceBase dataSource)
                     {
                         MaskLayerController.ShowProcessingRing();
-                        if (dataSource.Status != EnumDatabaseStatus.OK)
-                        {
-                            dataSource.ReconnectTime = DateTime.MinValue;
-                        }
-                        else
-                        {
-                            IoC.Get<GlobalData>().CheckUpdateTime = DateTime.MinValue;
-                        }
-
                         Task.Factory.StartNew(() =>
                         {
+                            var globalData = IoC.TryGet<GlobalData>();
+                            globalData?.StopTick();
                             try
                             {
-                                var ret = _dataSourceService.AddOrUpdateDataSource(dataSource);
+                                var ret = _dataSourceService.AddOrUpdateDataSource(dataSource, connectTimeOutSeconds: 10);
                                 if (ret.Status != EnumDatabaseStatus.OK)
                                 {
                                     MessageBoxHelper.ErrorAlert(ret.GetErrorMessage);
@@ -228,6 +215,7 @@ namespace _1RM.View.Settings.DataSource
                             }
                             finally
                             {
+                                globalData?.StartTick();
                                 MaskLayerController.HideMask();
                             }
                         });
@@ -235,6 +223,5 @@ namespace _1RM.View.Settings.DataSource
                 });
             }
         }
-
     }
 }

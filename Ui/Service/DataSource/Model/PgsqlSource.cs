@@ -1,10 +1,6 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
-using _1RM.Service.DataSource.DAO.Dapper;
 using _1RM.Service.DataSource.DAO;
+using _1RM.Service.DataSource.DAO.Dapper;
 using _1RM.Utils;
 using Newtonsoft.Json;
 
@@ -12,7 +8,6 @@ namespace _1RM.Service.DataSource.Model
 {
     public sealed class PgsqlSource : DataSourceBase
     {
-
         private string _host = "127.0.0.1";
         public string Host
         {
@@ -59,7 +54,6 @@ namespace _1RM.Service.DataSource.Model
             set
             {
                 EncryptPassword = string.IsNullOrEmpty(value) ? "" : UnSafeStringEncipher.SimpleEncrypt(value);
-                var t = UnSafeStringEncipher.SimpleDecrypt(EncryptPassword);
                 RaisePropertyChanged();
             }
         }
@@ -68,22 +62,42 @@ namespace _1RM.Service.DataSource.Model
         {
         }
 
-        public override string GetConnectionString(int connectTimeOutSeconds = 5)
+        public override string GetConnectionString(int connectTimeOutSeconds = 10)
         {
-            return DbExtensions.GetPgsqlConnectionString(_host, _port, _databaseName, _userName, Password, connectTimeOutSeconds);
+            return DbExtensions.GetPgsqlConnectionString(_host, _port, _databaseName, _userName, Password, Math.Max(connectTimeOutSeconds, 10));
         }
 
         [JsonIgnore]
         public override DatabaseType DatabaseType => DatabaseType.PostgreSQL;
 
-        [JsonIgnore] public override string Description => $"Host={Host};Port={Port};Database={DatabaseName};Username={UserName};...";
-        
+        [JsonIgnore]
+        public override string Description => $"Host={Host};Port={Port};Database={DatabaseName};Username={UserName};...";
+
         private IDatabase? _database = null;
         public override IDatabase GetDataBase()
         {
-            _database ??= new DapperDatabase(DatabaseName, DatabaseType.PostgreSQL);
-            _database.DatabaseName = DatabaseName;
-            return _database;
+            lock (this)
+            {
+                _database ??= new DapperDatabaseFree(DatabaseName, DatabaseType.PostgreSQL);
+                _database.DatabaseName = DatabaseName;
+                return _database;
+            }
+        }
+
+        public override DatabaseStatus Database_SelfCheck(int connectTimeOutSeconds = 10)
+        {
+            lock (this)
+            {
+                return base.Database_SelfCheck(Math.Max(connectTimeOutSeconds, 10));
+            }
+        }
+
+        public override void Database_CloseConnection()
+        {
+            lock (this)
+            {
+                base.Database_CloseConnection();
+            }
         }
 
         public static bool TestConnection(PgsqlSource config)
@@ -93,8 +107,8 @@ namespace _1RM.Service.DataSource.Model
 
         public static bool TestConnection(string host, int port, string dbName, string userName, string password)
         {
-            var str = DbExtensions.GetPgsqlConnectionString(host, port, dbName, userName, password, 2);
-            var db = new DapperDatabase(dbName, DatabaseType.PostgreSQL);
+            var str = DbExtensions.GetPgsqlConnectionString(host, port, dbName, userName, password, 10);
+            var db = new DapperDatabaseFree(dbName, DatabaseType.PostgreSQL);
             var ret = db.OpenNewConnection(str);
             db.CloseConnection();
             return ret.IsSuccess;

@@ -1,16 +1,20 @@
 ﻿using System;
+using System.Diagnostics;
 using System.Linq;
+using System.Runtime.InteropServices;
+using System.Threading;
 using System.Windows;
 using System.Windows.Input;
+using System.Windows.Interop;
 using System.Windows.Media;
+using System.Windows.Threading;
 using _1RM.Service;
 using _1RM.Utils;
 using _1RM.Utils.Tracing;
+using _1RM.View.Launcher;
 using Shawn.Utils;
 using Shawn.Utils.Wpf;
 using Stylet;
-using _1RM.View.Launcher;
-
 
 namespace _1RM.View
 {
@@ -23,10 +27,79 @@ namespace _1RM.View
         public const double LAUNCHER_OUTLINE_CORNER_RADIUS = 8;
         public static readonly CornerRadius LauncherOutlineCornerRadiusObj = new CornerRadius(LAUNCHER_OUTLINE_CORNER_RADIUS, LAUNCHER_OUTLINE_CORNER_RADIUS, LAUNCHER_OUTLINE_CORNER_RADIUS, LAUNCHER_OUTLINE_CORNER_RADIUS);
 
-
         public const int MAX_SERVER_COUNT = 8;
-        public const double MAX_SELECTION_HEIGHT = LauncherWindowViewModel.LAUNCHER_SERVER_LIST_ITEM_HEIGHT * MAX_SERVER_COUNT;
-        public const double MAX_WINDOW_HEIGHT = LauncherWindowViewModel.LAUNCHER_GRID_KEYWORD_HEIGHT + MAX_SELECTION_HEIGHT;
+        public const double MAX_SELECTION_HEIGHT = LAUNCHER_SERVER_LIST_ITEM_HEIGHT * MAX_SERVER_COUNT;
+        public const double MAX_WINDOW_HEIGHT = LAUNCHER_GRID_KEYWORD_HEIGHT + MAX_SELECTION_HEIGHT;
+
+        private static long _lastShowTimestampTicks = 0;
+        private static volatile bool _isLauncherVisibleOrOpening = false;
+
+        /// <summary>
+        /// True while the launcher popup is visible or within the initial focus handoff grace period,
+        /// preventing TabWindowView timers/WinEvent hooks from stealing foreground focus back.
+        /// </summary>
+        public static bool IsLauncherOpenOrOpening =>
+            _isLauncherVisibleOrOpening ||
+            (Stopwatch.GetTimestamp() - Interlocked.Read(ref _lastShowTimestampTicks)) < Stopwatch.Frequency / 2;
+
+        public static void MarkOpeningGracePeriod()
+        {
+            Interlocked.Exchange(ref _lastShowTimestampTicks, Stopwatch.GetTimestamp());
+            _isLauncherVisibleOrOpening = true;
+        }
+
+        public static void ResetOpeningStateForTest()
+        {
+            _isLauncherVisibleOrOpening = false;
+            Interlocked.Exchange(ref _lastShowTimestampTicks, 0);
+        }
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool BringWindowToTop(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr lpdwProcessId);
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentThreadId();
+
+        [DllImport("user32.dll")]
+        private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+
+        private static void ForceForegroundWindow(IntPtr hWnd)
+        {
+            if (hWnd == IntPtr.Zero) return;
+            var foreHwnd = GetForegroundWindow();
+            uint foreThread = foreHwnd != IntPtr.Zero ? GetWindowThreadProcessId(foreHwnd, IntPtr.Zero) : 0;
+            uint appThread = GetCurrentThreadId();
+            bool attached = false;
+            try
+            {
+                if (foreThread != 0 && foreThread != appThread)
+                {
+                    attached = AttachThreadInput(foreThread, appThread, true);
+                }
+                BringWindowToTop(hWnd);
+                SetForegroundWindow(hWnd);
+            }
+            catch
+            {
+                // ignore Win32 foreground handoff errors
+            }
+            finally
+            {
+                if (attached)
+                {
+                    AttachThreadInput(foreThread, appThread, false);
+                }
+            }
+        }
 
         private Visibility _serverSelectionsViewVisibility = Visibility.Visible;
         public Visibility ServerSelectionsViewVisibility
@@ -39,12 +112,8 @@ namespace _1RM.View
         public QuickConnectionViewModel QuickConnectionViewModel { get; }
         private readonly ConfigurationService _configurationService;
 
-        // Event handler delegates to prevent memory leaks
         private EventHandler? _deactivatedHandler;
         private KeyEventHandler? _keyDownHandler;
-
-        #region properties
-
 
         private double _gridMainHeight;
         public double GridMainHeight
@@ -59,7 +128,6 @@ namespace _1RM.View
             }
         }
 
-
         private RectangleGeometry? _gridMainClip = null;
         public RectangleGeometry? GridMainClip
         {
@@ -67,18 +135,13 @@ namespace _1RM.View
             set => SetAndNotifyIfChanged(ref _gridMainClip, value);
         }
 
-
         public double GridNoteHeight { get; }
-
         private double _noteWidth = 500;
-
         public double NoteWidth
         {
             get => _noteWidth;
             private set => SetAndNotifyIfChanged(ref _noteWidth, value);
         }
-
-        #endregion
 
         public LauncherWindowViewModel(ServerSelectionsViewModel serverSelectionsViewModel, QuickConnectionViewModel quickConnectionViewModel, ConfigurationService configurationService)
         {
@@ -91,7 +154,7 @@ namespace _1RM.View
         protected override void OnViewLoaded()
         {
             HideMe();
-            if (this.View is not LauncherWindowView {IsClosing: false} window) return;
+            if (this.View is not LauncherWindowView { IsClosing: false }) return;
             ServerSelectionsViewVisibility = Visibility.Visible;
             ReSetWindowHeight();
         }
@@ -102,7 +165,6 @@ namespace _1RM.View
             {
                 Execute.OnUIThreadSync(() =>
                 {
-                    // Unsubscribe from previous event handlers to prevent memory leaks
                     if (_deactivatedHandler != null)
                         window.Deactivated -= _deactivatedHandler;
                     if (_keyDownHandler != null)
@@ -111,8 +173,24 @@ namespace _1RM.View
                     SetHotKey(_configurationService.Launcher.LauncherEnabled,
                         _configurationService.Launcher.HotKeyModifiers, _configurationService.Launcher.HotKeyKey);
 
-                    // Create and subscribe new event handlers
-                    _deactivatedHandler = (s, a) => { HideMe(); };
+                    _deactivatedHandler = (s, a) =>
+                    {
+                        var elapsedMs = (Stopwatch.GetTimestamp() - Interlocked.Read(ref _lastShowTimestampTicks)) * 1000.0 / Stopwatch.Frequency;
+                        if (elapsedMs < 350 && System.Windows.Forms.Control.MouseButtons == System.Windows.Forms.MouseButtons.None)
+                        {
+                            Execute.OnUIThread(() =>
+                            {
+                                if (_isLauncherVisibleOrOpening && window is { IsClosing: false, Visibility: Visibility.Visible })
+                                {
+                                    ForceForegroundWindow(new WindowInteropHelper(window).Handle);
+                                    window.Activate();
+                                    ServerSelectionsViewModel.Show();
+                                }
+                            });
+                            return;
+                        }
+                        HideMe();
+                    };
                     _keyDownHandler = (s, a) => { if (a.Key == Key.Escape) HideMe(); };
 
                     window.Deactivated += _deactivatedHandler;
@@ -122,7 +200,6 @@ namespace _1RM.View
                 });
             }
         }
-
 
         public void ReSetWindowHeight()
         {
@@ -134,45 +211,57 @@ namespace _1RM.View
             });
         }
 
-
         public void ShowMe()
         {
             if (this.View is LauncherWindowView { IsClosing: false } window)
             {
-                SimpleLogHelper.Debug($"Call shortcut to invoke launcher Visibility = {window.Visibility}");
                 if (IoC.Get<MainWindowViewModel>().TopLevelViewModel != null) return;
                 if (IoC.Get<ConfigurationService>().Launcher.LauncherEnabled == false) return;
 
-                lock (this)
+                MarkOpeningGracePeriod();
+                Execute.OnUIThreadSync(() =>
                 {
-                    //if (window.Visibility != Visibility.Visible)
-                    //{
-                    //    MsAppCenterHelper.TraceView(nameof(LauncherWindowView), true);
-                    //}
-                    window.WindowState = WindowState.Normal;
-                    QuickConnectionViewModel.SelectedProtocol = QuickConnectionViewModel.Protocols.First();
-                    ReSetWindowHeight();
+                    lock (this)
+                    {
+                        window.WindowState = WindowState.Normal;
+                        QuickConnectionViewModel.SelectedProtocol = QuickConnectionViewModel.Protocols.First();
+                        GridMainHeight = ServerSelectionsViewVisibility == Visibility.Visible
+                            ? ServerSelectionsViewModel.ReCalcGridMainHeight()
+                            : QuickConnectionViewModel.ReCalcGridMainHeight();
 
-                    // show position
-                    var p = ScreenInfoEx.GetMouseSystemPosition();
-                    var screenEx = ScreenInfoEx.GetCurrentScreenBySystemPosition(p);
-                    window.Top = screenEx.VirtualWorkingAreaCenter.Y - GridMainHeight / 2 - 40; // 40: margin of BorderMainContent
-                    window.Left = screenEx.VirtualWorkingAreaCenter.X - window.BorderMainContent.ActualWidth / 2;
+                        var p = ScreenInfoEx.GetMouseSystemPosition();
+                        var screenEx = ScreenInfoEx.GetCurrentScreenBySystemPosition(p);
+                        var contentWidth = window.BorderMainContent.ActualWidth > 1
+                            ? window.BorderMainContent.ActualWidth
+                            : LAUNCHER_LIST_AREA_WIDTH + 20;
+                        window.Top = screenEx.VirtualWorkingAreaCenter.Y - GridMainHeight / 2 - 40;
+                        window.Left = screenEx.VirtualWorkingAreaCenter.X - contentWidth / 2;
 
-                    var noteWidth = (screenEx.VirtualWorkingArea.Width - window.BorderMainContent.ActualWidth - 100) / 2;
-                    if (noteWidth < 100)
-                        noteWidth = 100;
-                    NoteWidth = Math.Min(noteWidth, NoteWidth);
+                        var noteWidth = (screenEx.VirtualWorkingArea.Width - contentWidth - 100) / 2;
+                        if (noteWidth < 100)
+                            noteWidth = 100;
+                        NoteWidth = Math.Min(noteWidth, NoteWidth);
 
-                    window.Show();
-                    window.Visibility = Visibility.Visible;
-                    window.Activate();
-                    window.Topmost = true; // important
-                    window.Topmost = false; // important
-                    window.Topmost = true; // important
-                    window.Focus(); // important
-                    ServerSelectionsViewModel.Show();
-                }
+                        window.Topmost = true;
+                        window.Show();
+                        window.Visibility = Visibility.Visible;
+                        ForceForegroundWindow(new WindowInteropHelper(window).Handle);
+                        window.Activate();
+                        window.Focus();
+                        ServerSelectionsViewModel.Show();
+
+                        window.Dispatcher.InvokeAsync(() =>
+                        {
+                            if (_isLauncherVisibleOrOpening && window is { IsClosing: false, Visibility: Visibility.Visible })
+                            {
+                                ForceForegroundWindow(new WindowInteropHelper(window).Handle);
+                                window.Activate();
+                                if (ServerSelectionsViewModel.View is ServerSelectionsView ssv)
+                                    ssv.TbKeyWord.Focus();
+                            }
+                        }, DispatcherPriority.Input);
+                    }
+                });
             }
             else if (this.View is not LauncherWindowView)
             {
@@ -180,28 +269,24 @@ namespace _1RM.View
             }
         }
 
-
         public void HideMe()
         {
-            if (this.View is not LauncherWindowView {IsClosing: false} window) return;
+            _isLauncherVisibleOrOpening = false;
+            Interlocked.Exchange(ref _lastShowTimestampTicks, 0);
+            if (this.View is not LauncherWindowView { IsClosing: false } window) return;
             lock (this)
             {
                 Execute.OnUIThread(() =>
                 {
-                    //if (window.Visibility == Visibility.Visible)
-                    //{
-                    //    MsAppCenterHelper.TraceView(nameof(LauncherWindowView), false);
-                    //}
+                    _isLauncherVisibleOrOpening = false;
                     window.Hide();
                     QuickConnectionViewModel.Filter = "";
                     QuickConnectionViewModel.Show();
                     ServerSelectionsViewModel.Show();
-                    // After startup and initalizing our application and when closing our window and minimize the application to tray we free memory with the following line:
                     System.Diagnostics.Process.GetCurrentProcess().MinWorkingSet = System.Diagnostics.Process.GetCurrentProcess().MinWorkingSet;
                 });
             }
         }
-
 
         public bool SetHotKey(bool launcherEnabled, HotkeyModifierKeys hotKeyModifierKeys, Key hotKeyKey)
         {
@@ -215,27 +300,27 @@ namespace _1RM.View
                 case GlobalHotkeyHooker.RetCode.Success:
                     return true;
                 case GlobalHotkeyHooker.RetCode.ERROR_HOTKEY_NOT_REGISTERED:
-                {
-                    var msg = $"{IoC.Translate("hotkey_registered_fail")}: {r.Item2}";
-                    SimpleLogHelper.Warning(msg);
-                    MessageBoxHelper.Warning(msg);
-                    break;
-                }
+                    {
+                        var msg = $"{IoC.Translate("hotkey_registered_fail")}: {r.Item2}";
+                        SimpleLogHelper.Warning(msg);
+                        MessageBoxHelper.Warning(msg);
+                        break;
+                    }
                 case GlobalHotkeyHooker.RetCode.ERROR_HOTKEY_ALREADY_REGISTERED:
-                {
-                    var msg = $"{IoC.Translate("hotkey_already_registered")}: {r.Item2}";
-                    SimpleLogHelper.Warning(msg);
-                    MessageBoxHelper.Warning(msg);
-                    break;
-                }
+                    {
+                        var msg = $"{IoC.Translate("hotkey_already_registered")}: {r.Item2}";
+                        SimpleLogHelper.Warning(msg);
+                        MessageBoxHelper.Warning(msg);
+                        break;
+                    }
                 default:
-                {
-                    var msg = $"Failed to register hotkey {hotKeyModifierKeys} + {hotKeyKey}, error code: {r.Item1}";
-                    SimpleLogHelper.Warning(msg);
-                    MessageBoxHelper.Warning(msg);
-                    UnifyTracing.Error(new Exception(msg));
-                    break;
-                }
+                    {
+                        var msg = $"Failed to register hotkey {hotKeyModifierKeys} + {hotKeyKey}, error code: {r.Item1}";
+                        SimpleLogHelper.Warning(msg);
+                        MessageBoxHelper.Warning(msg);
+                        UnifyTracing.Error(new Exception(msg));
+                        break;
+                    }
             }
             return false;
         }
@@ -243,13 +328,9 @@ namespace _1RM.View
         public void ToggleQuickConnection()
         {
             if (ServerSelectionsViewVisibility == Visibility.Collapsed)
-            {
                 ServerSelectionsViewModel.Show();
-            }
             else
-            {
                 QuickConnectionViewModel.Show();
-            }
             ServerSelectionsViewModel.CalcNoteFieldVisibility();
             ReSetWindowHeight();
         }

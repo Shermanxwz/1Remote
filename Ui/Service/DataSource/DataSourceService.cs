@@ -7,7 +7,6 @@ using System.Text;
 using _1RM.Model;
 using _1RM.Model.Protocol.Base;
 using _1RM.Service.DataSource.DAO;
-using _1RM.Service.DataSource.DAO.Dapper;
 using _1RM.Service.DataSource.Model;
 using _1RM.Utils.Tracing;
 using _1RM.View;
@@ -91,7 +90,6 @@ namespace _1RM.Service.DataSource
             }
         }
 
-
         public List<(DataSourceBase, Credential)> GetSourceCredentials(bool force)
         {
             lock (this)
@@ -99,7 +97,7 @@ namespace _1RM.Service.DataSource
                 var ret = new List<(DataSourceBase, Credential)>(100);
                 if (LocalDataSource != null)
                 {
-                    ret.AddRange(LocalDataSource.GetCredentials().Select(credential => (LocalDataSource, credential)).Select(dummy => ((DataSourceBase, Credential)) dummy));
+                    ret.AddRange(LocalDataSource.GetCredentials().Select(credential => (LocalDataSource, credential)).Select(dummy => ((DataSourceBase, Credential))dummy));
                 }
                 foreach (var dataSource in AdditionalSources)
                 {
@@ -117,7 +115,6 @@ namespace _1RM.Service.DataSource
             }
         }
 
-
         public DataSourceBase? GetDataSource(string sourceId = LOCAL_DATA_SOURCE_NAME)
         {
             if (string.IsNullOrEmpty(sourceId) || sourceId == LOCAL_DATA_SOURCE_NAME)
@@ -127,10 +124,6 @@ namespace _1RM.Service.DataSource
             return null;
         }
 
-
-        /// <summary>
-        /// init db connection to a sqlite db. Do make sure sqlitePath is writable!.
-        /// </summary>
         public DatabaseStatus InitLocalDataSource(SqliteSource sqliteConfig)
         {
             LocalDataSource?.Database_CloseConnection();
@@ -147,34 +140,30 @@ namespace _1RM.Service.DataSource
             return ret;
         }
 
-        /// <summary>
-        /// 添加并启用一个新的数据源（如果该数据源已存在，则更新），返回数据源的连接状态
-        /// </summary>
-        public DatabaseStatus AddOrUpdateDataSource(DataSourceBase newDataSource, int connectTimeOutSeconds = 2, bool doReload = true)
+        public DatabaseStatus AddOrUpdateDataSource(DataSourceBase newDataSource, int connectTimeOutSeconds = 10, bool doReload = true)
         {
+            var globalData = connectTimeOutSeconds > 0 ? IoC.TryGet<GlobalData>() : null;
+            globalData?.StopTick();
             try
             {
-                newDataSource.ClearReadTimestamp(); // reload database
+                newDataSource.ClearReadTimestamp();
                 if (newDataSource is SqliteSource { DataSourceName: LOCAL_DATA_SOURCE_NAME } localConfig)
                 {
                     return InitLocalDataSource(localConfig);
                 }
 
-                // remove the old one
                 {
-                    var olds = AdditionalSources.Where(x => x.Value == newDataSource);
+                    var olds = AdditionalSources.Where(x => x.Value == newDataSource).ToArray();
                     foreach (var pair in olds)
                     {
                         AdditionalSources.TryRemove(pair.Key, out var tmp);
                         tmp?.Database_CloseConnection();
                     }
-
                     {
                         AdditionalSources.TryRemove(newDataSource.DataSourceName, out var tmp);
                         tmp?.Database_CloseConnection();
                     }
                 }
-
 
                 newDataSource.Database_CloseConnection();
                 var ret = DatabaseStatus.New(EnumDatabaseStatus.NotConnectedYet);
@@ -187,13 +176,13 @@ namespace _1RM.Service.DataSource
             {
                 SimpleLogHelper.Warning(e);
                 UnifyTracing.Error(e);
-                var ret = DatabaseStatus.New(EnumDatabaseStatus.OtherError, e.Message);
-                return ret;
+                return DatabaseStatus.New(EnumDatabaseStatus.OtherError, e.Message);
             }
             finally
             {
                 if (doReload)
-                    IoC.Get<GlobalData>().ReloadAll(); // reload server list after adding a new data source
+                    IoC.TryGet<GlobalData>()?.ReloadAll();
+                globalData?.StartTick();
             }
         }
 
@@ -201,12 +190,12 @@ namespace _1RM.Service.DataSource
         {
             if (name == LOCAL_DATA_SOURCE_NAME)
                 return;
-            else if (AdditionalSources.ContainsKey(name))
+            if (AdditionalSources.ContainsKey(name))
             {
                 AdditionalSources[name].Database_CloseConnection();
                 if (AdditionalSources.TryRemove(name, out _))
                 {
-                    IoC.Get<GlobalData>().ReloadAll(true); // reload server list after removing a data source
+                    IoC.Get<GlobalData>().ReloadAll(true);
                 }
             }
         }
@@ -223,55 +212,35 @@ namespace _1RM.Service.DataSource
             return ads;
         }
 
-
         public static void AdditionalSourcesSaveToProfile(string path, List<DataSourceBase> sources)
         {
-            try
+            if (sources.Count == 0)
             {
-                if (sources.Count == 0)
-                {
-                    var fi = new FileInfo(path);
-                    if (fi.Exists)
-                        fi.Delete();
-                }
-                else
-                {
-                    var fi = new FileInfo(path);
-                    try
-                    {
-                        if (fi?.Directory?.Exists == false)
-                            fi.Directory.Create();
-                    }
-                    catch (Exception e)
-                    {
-                        SimpleLogHelper.Error(e);
-                        return;
-                    }
-                    if (IoPermissionHelper.HasWritePermissionOnFile(path))
-                        RetryHelper.Try(() =>
-                        {
-                            File.WriteAllText(path, JsonConvert.SerializeObject(sources, Formatting.Indented), Encoding.UTF8);
-                        }, actionOnError: exception => UnifyTracing.Error(exception));
-                }
+                var fi = new FileInfo(path);
+                if (fi.Exists)
+                    fi.Delete();
             }
-            finally
+            else
             {
-
+                var fi = new FileInfo(path);
+                try
+                {
+                    if (fi?.Directory?.Exists == false)
+                        fi.Directory.Create();
+                }
+                catch (Exception e)
+                {
+                    SimpleLogHelper.Error(e);
+                    return;
+                }
+                if (IoPermissionHelper.HasWritePermissionOnFile(path))
+                {
+                    RetryHelper.Try(() =>
+                    {
+                        File.WriteAllText(path, JsonConvert.SerializeObject(sources, Formatting.Indented), Encoding.UTF8);
+                    }, actionOnError: exception => UnifyTracing.Error(exception));
+                }
             }
         }
     }
-
-    //public static class DataSourceServiceExtend
-    //{
-    //    public static DataSourceBase? GetDataSource(this ProtocolBase protocol)
-    //    {
-    //        return protocol.DataSource;
-    //        //return IoC.Get<DataSourceService>().GetDataSource(protocol.DataSource);
-    //    }
-    //    public static DataSourceBase? GetDataSource(this ProtocolBaseViewModel protocol)
-    //    {
-    //        return protocol.DataSource;
-    //        //return IoC.Get<DataSourceService>().GetDataSource(protocol.Server.DataSource);
-    //    }
-    //}
 }

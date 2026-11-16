@@ -3,9 +3,9 @@ using System.Collections.ObjectModel;
 using System.Collections.Specialized;
 using System.ComponentModel;
 using System.Linq;
+using System.Timers;
 using System.Windows;
 using System.Windows.Interop;
-using System.Timers;
 using Dragablz;
 using _1RM.Service;
 using _1RM.Utils;
@@ -26,7 +26,7 @@ namespace _1RM.View.Host
 
         private IntPtr _hWndTabContent = IntPtr.Zero;
         private readonly Timer _timer_ObserveTabSwitching = new Timer(5);
-        private ElapsedEventHandler _awaitTabSwitchingHandler;
+        private ElapsedEventHandler _awaitTabSwitchingHandler = null!;
         private int _timer_Count = 0;
 
         private void InitTabSwitchingTimer()
@@ -47,9 +47,6 @@ namespace _1RM.View.Host
         private void ItemsOnCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
         {
             RaisePropertyChanged(nameof(BtnCloseAllVisibility));
-            // Dragablz inter-tab drag adds items straight to the ItemsSource, bypassing AddItem();
-            // keep the host's parent window reference in sync (used for RDP fullscreen sizing etc.).
-            // Reset (Items.Clear() on Dispose) carries no NewItems.
             if (e.Action == NotifyCollectionChangedAction.Add && e.NewItems != null)
             {
                 foreach (var item in e.NewItems.OfType<TabItemViewModel>())
@@ -94,15 +91,13 @@ namespace _1RM.View.Host
         {
             get
             {
-                if (SelectedItem?.Content == null
-                    || SelectedItem.Content.CanResizeNow() == false)
+                if (SelectedItem?.Content == null || SelectedItem.Content.CanResizeNow() == false)
                     return ResizeMode.NoResize;
                 return ResizeMode.CanResize;
             }
         }
 
         public ObservableCollection<TabItemViewModel> Items { get; } = new ObservableCollection<TabItemViewModel>();
-
         public Visibility BtnCloseAllVisibility => Items.Count > 1 ? Visibility.Visible : Visibility.Collapsed;
 
         private TabItemViewModel? _selectedItem = null;
@@ -112,8 +107,6 @@ namespace _1RM.View.Host
             set
             {
                 _timer_ObserveTabSwitching.Stop();
-
-                // Get effective window of the current tab content.
                 _hWndTabContent = GetCurrentTabContentWindow();
 
                 if (_selectedItem != null)
@@ -132,18 +125,7 @@ namespace _1RM.View.Host
                     {
                         SetTitle();
                         _selectedItem.Content.OnCanResizeNowChanged += OnCanResizeNowChanged;
-
-                        // Here, the SelectedItem property has merely been assigned a new value;
-                        // the tab switching process is not yet complete. Therefore, it is still
-                        // not possible to give focus to the tab that will become active.
-
-                        // Commented out for the reasons above.
-                        // _selectedItem.Content.FocusOnMe();
-
-                        // Since there is no event notification when a new tab becomes active,
-                        // we use a timer to detect this change and then give focus to the newly
-                        // active tab.
-                        _timer_Count = 40;  // 5ms interval, total 200ms
+                        _timer_Count = 40;
                         _timer_ObserveTabSwitching.Start();
                     }
                     foreach (var item in Items)
@@ -160,13 +142,9 @@ namespace _1RM.View.Host
 
         private IntPtr GetCurrentTabContentWindow()
         {
-            // Look for the visible child hwnd inside *this* window. Do NOT locate the parent by
-            // window title: after a drag-detach two TabWindowViews share the same title.
             IntPtr hWndParent = new WindowInteropHelper(View).Handle;
             if (hWndParent == IntPtr.Zero)
-            {
                 return IntPtr.Zero;
-            }
             IntPtr last = IntPtr.Zero;
             do
             {
@@ -182,10 +160,11 @@ namespace _1RM.View.Host
 
         private void AwaitTabSwitching()
         {
-            if (_timer_Count <= 0) return;
+            if (_timer_Count <= 0 || LauncherWindowViewModel.IsLauncherOpenOrOpening) return;
             _timer_Count--;
             Execute.OnUIThreadSync(() =>
             {
+                if (LauncherWindowViewModel.IsLauncherOpenOrOpening) return;
                 var hWnd = GetCurrentTabContentWindow();
                 if (hWnd == IntPtr.Zero || hWnd == _hWndTabContent) _timer_ObserveTabSwitching.Start();
                 else Win32Api.SetForegroundWindow(hWnd);
@@ -195,9 +174,7 @@ namespace _1RM.View.Host
         private void SelectedItemOnPropertyChanged(object? sender, PropertyChangedEventArgs e)
         {
             if (e.PropertyName == nameof(TabItemViewModel.DisplayName))
-            {
                 SetTitle();
-            }
         }
 
         private void OnCanResizeNowChanged()
@@ -205,12 +182,7 @@ namespace _1RM.View.Host
             RaisePropertyChanged(nameof(WindowResizeMode));
         }
 
-
-        #region drag drop tab
-
         public IInterTabClient InterTabClient { get; } = new InterTabClient();
-
-        #endregion drag drop tab
 
         private void SetTitle()
         {
@@ -228,7 +200,6 @@ namespace _1RM.View.Host
                 Execute.OnUIThreadSync(() =>
                 {
                     Items.Remove(item);
-                    // Dispose the item to release event subscriptions
                     if (item is IDisposable disposable)
                     {
                         disposable.Dispose();
@@ -257,200 +228,123 @@ namespace _1RM.View.Host
             return Items.FirstOrDefault(x => x.Content.ConnectionId == connectionId);
         }
 
-
-        #region CMD
-
         private RelayCommand? _cmdHostGoFullScreen;
-        public RelayCommand CmdHostGoFullScreen
+        public RelayCommand CmdHostGoFullScreen => _cmdHostGoFullScreen ??= new RelayCommand((o) =>
         {
-            get
-            {
-                return _cmdHostGoFullScreen ??= new RelayCommand((o) =>
-                {
-                    if (this.SelectedItem?.Content?.CanResizeNow() ?? false)
-                        IoC.Get<SessionControlService>().MoveSessionToFullScreen(SelectedItem.Content.ConnectionId);
-                }, o => this.SelectedItem != null && (this.SelectedItem.Content?.CanFullScreen ?? false));
-            }
-        }
+            if (this.SelectedItem?.Content?.CanResizeNow() ?? false)
+                IoC.Get<SessionControlService>().MoveSessionToFullScreen(SelectedItem.Content.ConnectionId);
+        }, o => this.SelectedItem != null && (this.SelectedItem.Content?.CanFullScreen ?? false));
 
         private RelayCommand? _cmdInvokeLauncher;
-        public RelayCommand CmdInvokeLauncher
+        public RelayCommand CmdInvokeLauncher => _cmdInvokeLauncher ??= new RelayCommand((o) =>
         {
-            get
-            {
-                return _cmdInvokeLauncher ??= new RelayCommand((o) => { IoC.Get<LauncherWindowViewModel>().ShowMe(); }, o => this.SelectedItem != null);
-            }
-        }
+            _timer_ObserveTabSwitching.Stop();
+            _timer_Count = 0;
+            IoC.Get<SessionControlService>().MarkTabWindowActive(Token);
+            IoC.Get<LauncherWindowViewModel>().ShowMe();
+        }, o => this.SelectedItem != null);
 
         private RelayCommand? _cmdShowTabByIndex;
-        public RelayCommand CmdShowTabByIndex
+        public RelayCommand CmdShowTabByIndex => _cmdShowTabByIndex ??= new RelayCommand((o) =>
         {
-            get
+            if (int.TryParse(o?.ToString() ?? "0", out int i))
             {
-                return _cmdShowTabByIndex ??= new RelayCommand((o) =>
-                {
-                    if (int.TryParse(o?.ToString() ?? "0", out int i))
-                    {
-                        if (i > 0 && i <= Items.Count)
-                        {
-                            SelectedItem = Items[i - 1];
-                        }
-                    }
-                }, o => this.SelectedItem != null);
+                if (i > 0 && i <= Items.Count)
+                    SelectedItem = Items[i - 1];
             }
-        }
+        }, o => this.SelectedItem != null);
 
         private RelayCommand? _cmdGoMinimize;
-        public RelayCommand CmdGoMinimize
+        public RelayCommand CmdGoMinimize => _cmdGoMinimize ??= new RelayCommand((_) =>
         {
-            get
-            {
-                return _cmdGoMinimize ??= new RelayCommand((_) =>
-                {
-                    if (this.View is Window window)
-                    {
-                        window.WindowState = WindowState.Minimized;
-                    }
-                });
-            }
-        }
+            if (this.View is Window window)
+                window.WindowState = WindowState.Minimized;
+        });
 
         private RelayCommand? _cmdGoMaximize;
-        public RelayCommand CmdGoMaximize
+        public RelayCommand CmdGoMaximize => _cmdGoMaximize ??= new RelayCommand((o) =>
         {
-            get
+            if (View.WindowState != WindowState.Maximized)
             {
-                return _cmdGoMaximize ??= new RelayCommand((o) =>
-                {
-                    if (View.WindowState != WindowState.Maximized)
-                    {
-                        View.WindowState = WindowState.Maximized;
-                    }
-                    else
-                    {
-                        View.WindowStyle = WindowStyle.SingleBorderWindow;
-                        View.WindowState = WindowState.Normal;
-                    }
-                });
+                View.WindowState = WindowState.Maximized;
             }
-        }
-
+            else
+            {
+                View.WindowStyle = WindowStyle.SingleBorderWindow;
+                View.WindowState = WindowState.Normal;
+            }
+        });
 
         private RelayCommand? _cmdGoMaximizeF11;
-        public RelayCommand CmdGoMaximizeF11
+        public RelayCommand CmdGoMaximizeF11 => _cmdGoMaximizeF11 ??= new RelayCommand((o) =>
         {
-            get
+            if (View.WindowState != WindowState.Maximized)
             {
-                return _cmdGoMaximizeF11 ??= new RelayCommand((o) =>
-                {
-                    if (View.WindowState != WindowState.Maximized)
-                    {
-                        View.WindowStyle = WindowStyle.None;
-                        View.WindowState = WindowState.Maximized;
-                    }
-                    else
-                    {
-                        View.WindowStyle = WindowStyle.SingleBorderWindow;
-                        View.WindowState = WindowState.Normal;
-                    }
-                });
+                View.WindowStyle = WindowStyle.None;
+                View.WindowState = WindowState.Maximized;
             }
-        }
-
+            else
+            {
+                View.WindowStyle = WindowStyle.SingleBorderWindow;
+                View.WindowState = WindowState.Normal;
+            }
+        });
 
         private readonly object _canCmdClose = new object();
         private RelayCommand? _cmdCloseAll;
-        public RelayCommand CmdCloseAll
+        public RelayCommand CmdCloseAll => _cmdCloseAll ??= new RelayCommand((o) =>
         {
-            get
+            if (this.Items.Count <= 0 || App.ExitingFlag != false) return;
+            lock (_canCmdClose)
             {
-                return _cmdCloseAll ??= new RelayCommand((o) =>
+                if (this.Items.Count <= 0 || App.ExitingFlag != false) return;
+                if (IoC.Get<ConfigurationService>().General.ConfirmBeforeClosingSession == true
+                    && false == MessageBoxHelper.Confirm(IoC.Translate("Are you sure you want to close the connection?"), ownerViewModel: this))
                 {
-                    if (this.Items.Count <= 0 || App.ExitingFlag != false) return;
-                    lock (_canCmdClose)
-                    {
-                        if (this.Items.Count <= 0 || App.ExitingFlag != false) return;
-                        if (IoC.Get<ConfigurationService>().General.ConfirmBeforeClosingSession == true
-                            && false == MessageBoxHelper.Confirm(IoC.Translate("Are you sure you want to close the connection?"), ownerViewModel: this))
-                        {
-                        }
-                        else
-                        {
-                            IoC.Get<SessionControlService>().CloseProtocolHostAsync(
-                                Items
-                                    .Select(x => x.Content.ConnectionId).ToArray());
-                        }
-                    }
-                });
+                }
+                else
+                {
+                    IoC.Get<SessionControlService>().CloseProtocolHostAsync(Items.Select(x => x.Content.ConnectionId).ToArray());
+                }
             }
-        }
+        });
 
         private RelayCommand? _cmdClose;
-        public RelayCommand CmdClose
+        public RelayCommand CmdClose => _cmdClose ??= new RelayCommand((o) =>
         {
-            get
+            lock (_canCmdClose)
             {
-                return _cmdClose ??= new RelayCommand((o) =>
+                if (IoC.Get<ConfigurationService>().General.ConfirmBeforeClosingSession == true
+                    && App.ExitingFlag == false
+                    && false == MessageBoxHelper.Confirm(IoC.Translate("Are you sure you want to close the connection?"), ownerViewModel: this))
                 {
-                    lock (_canCmdClose)
-                    {
-                        if (IoC.Get<ConfigurationService>().General.ConfirmBeforeClosingSession == true
-                            && App.ExitingFlag == false
-                            && false == MessageBoxHelper.Confirm(IoC.Translate("Are you sure you want to close the connection?"), ownerViewModel: this))
-                        {
-                        }
-                        else
-                        {
-                            HostBase? host = null;
-                            if (o is string connectionId)
-                            {
-                                host = Items.FirstOrDefault(x => x.Content.ConnectionId == connectionId)?.Content;
-                            }
-                            else
-                            {
-                                host = SelectedItem?.Content;
-                            }
+                }
+                else
+                {
+                    HostBase? host = o is string connectionId
+                        ? Items.FirstOrDefault(x => x.Content.ConnectionId == connectionId)?.Content
+                        : SelectedItem?.Content;
 
-                            if (host != null)
-                            {
-                                IoC.Get<SessionControlService>().CloseProtocolHostAsync(host.ConnectionId);
-                            }
-                        }
-                    }
-                }, o => this.SelectedItem != null);
+                    if (host != null)
+                        IoC.Get<SessionControlService>().CloseProtocolHostAsync(host.ConnectionId);
+                }
             }
-        }
-
-        #endregion CMD
+        }, o => this.SelectedItem != null);
     }
 
     public class InterTabClient : IInterTabClient
     {
-        /// <summary>
-        /// split tab window
-        /// </summary>
-        /// <param name="interTabClient"></param>
-        /// <param name="partition"></param>
-        /// <param name="source"></param>
-        /// <returns></returns>
         public INewTabHost<Window> GetNewHost(IInterTabClient interTabClient, object partition, TabablzControl source)
         {
             var v = new TabWindowView
             {
                 IsCreatedByDragDetach = true,
-                // Dragablz sets Left/Top/Width/Height before Show(); Manual makes them effective.
                 WindowStartupLocation = WindowStartupLocation.Manual,
             };
             IoC.Get<SessionControlService>().AddTab(v);
             return new NewTabHost<Window>(v, v.TabablzControl);
         }
 
-        /// <summary>
-        /// merge tab window
-        /// </summary>
-        /// <param name="tabControl"></param>
-        /// <param name="window"></param>
-        /// <returns></returns>
         public TabEmptiedResponse TabEmptiedHandler(TabablzControl tabControl, Window window)
         {
             if (window is TabWindowView tab)

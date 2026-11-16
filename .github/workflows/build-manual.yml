@@ -1,8 +1,5 @@
 name: Manual Build (net9 / net10 / net11)
 
-# Trigger manually from the Actions tab (Run workflow) after pushing a commit.
-# Builds 1Remote packages for .NET 9 / 10 / 11 and uploads them as run artifacts.
-# Nothing is published to a release.
 on:
   workflow_dispatch:
     inputs:
@@ -10,7 +7,7 @@ on:
         description: '.NET target framework to build'
         type: choice
         required: true
-        default: all
+        default: net10
         options:
           - all
           - net9
@@ -32,19 +29,12 @@ jobs:
       Main_Project: Ui/Ui.csproj
 
     steps:
-      - name: Echo
-        shell: pwsh
-        run: |
-          echo "tfm = ${{ inputs.tfm }}"
-          echo "self_contained = ${{ inputs.self_contained }}"
-
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           submodules: recursive
 
-      # Install the .NET Core workload https://github.com/actions/setup-dotnet
       - name: Install .NET
         uses: actions/setup-dotnet@v4
         with:
@@ -52,110 +42,106 @@ jobs:
             9.0.x
             10.0.x
 
-      # .NET 11 is RC until GA (2026-11-10): the official dotnet-install script
-      # resolves the latest 11.0 build (RC now, GA after 2026-11-10) from release metadata.
       - name: Install .NET 11 SDK
         shell: pwsh
         run: |
           Invoke-WebRequest -UseBasicParsing https://dot.net/v1/dotnet-install.ps1 -OutFile dotnet-install.ps1
-          $installDir = if ($env:DOTNET_ROOT) { $env:DOTNET_ROOT } else { "C:\Program Files\dotnet" }
+          $installDir = if ($env:DOTNET_ROOT) { $env:DOTNET_ROOT } else { "C:\\Program Files\\dotnet" }
           ./dotnet-install.ps1 -Channel 11.0 -InstallDir $installDir
           dotnet --list-sdks
 
-      # Add MSBuild to the PATH: https://github.com/microsoft/setup-msbuild
       - name: Setup MSBuild.exe
         uses: microsoft/setup-msbuild@v2
 
-      # cache nuget packages: https://github.com/actions/cache
       - name: Cache nuget packages
-        id: cache-nuget-packages
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
-          path: ${{ github.workspace }}\.nuget\packages
-          key: ${{ runner.os }}-nuget-${{ hashFiles('Ui/Ui.csproj') }}
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('Ui/Ui.csproj', 'Tests/Tests.csproj') }}
           restore-keys: |
             ${{ runner.os }}-nuget-
 
-      # Restore nuget packages
-      - name: Restore nuget packages
-        run: msbuild $env:Main_Project /t:Restore /p:Configuration=$env:Configuration
-
-      # Run script
-      - name: Run script
+      - name: Restore NuGet packages
         shell: pwsh
         run: |
-          ./scripts/Set-Secret.ps1 -filePath .\Ui\Assert.cs -Pattern "===REPLACE_ME_WITH_APP_CENTER_SECRET===" -Secret ${{ secrets.APP_CENTER_SECRET_1REMOTE }}
-          ./scripts/Set-Secret.ps1 -filePath .\Ui\Assert.cs -Pattern "===REPLACE_ME_WITH_SENTRY_IO_DEN===" -Secret ${{ secrets.SENTRY_IO_DEN }}
-          ./scripts/Set-Secret.ps1 -filePath .\Ui\Assert.cs -Pattern "===REPLACE_ME_WITH_SALT===" -Secret ${{ secrets.GLOBAL_STRING_ENCRYPTION_SLAT }}
+          msbuild $env:Main_Project /t:Restore /p:Configuration=$env:Configuration
+          dotnet restore Tests/Tests.csproj
 
-      # Get ${{env.BuildVersion}} and ${{env.PreRelease}}
+      - name: Apply optional build secrets
+        shell: pwsh
+        env:
+          SEC_APPCENTER: ${{ secrets.APP_CENTER_SECRET_1REMOTE }}
+          SEC_SENTRY: ${{ secrets.SENTRY_IO_DEN }}
+          SEC_SALT: ${{ secrets.GLOBAL_STRING_ENCRYPTION_SLAT }}
+        run: |
+          if (-not [string]::IsNullOrEmpty($env:SEC_APPCENTER)) {
+            ./scripts/Set-Secret.ps1 -filePath .\\Ui\\Assert.cs -Pattern "===REPLACE_ME_WITH_APP_CENTER_SECRET===" -Secret $env:SEC_APPCENTER
+          }
+          if (-not [string]::IsNullOrEmpty($env:SEC_SENTRY)) {
+            ./scripts/Set-Secret.ps1 -filePath .\\Ui\\Assert.cs -Pattern "===REPLACE_ME_WITH_SENTRY_IO_DEN===" -Secret $env:SEC_SENTRY
+          }
+          if (-not [string]::IsNullOrEmpty($env:SEC_SALT)) {
+            ./scripts/Set-Secret.ps1 -filePath .\\Ui\\Assert.cs -Pattern "===REPLACE_ME_WITH_SALT===" -Secret $env:SEC_SALT
+          }
+
       - name: Get Version
-        id: get_version
+        shell: pwsh
         run: ./scripts/Get-Version.ps1
 
-      # Publish the application net9
-      - name: Publish the application net9
+      - name: Run Unit & Regression Tests
+        shell: pwsh
+        run: dotnet test Tests/Tests.csproj -c Release --verbosity normal
+
+      - name: Publish net9
         if: ${{ inputs.tfm == 'all' || inputs.tfm == 'net9' }}
         run: dotnet publish $env:Main_Project -p:PublishProfile=./Ui/Properties/PublishProfiles/x64-net90.pubxml
-      # artifact
       - uses: actions/upload-artifact@v4
         if: ${{ inputs.tfm == 'all' || inputs.tfm == 'net9' }}
         with:
-          name: 1Remote-${{env.BuildVersion}}-net9-x64
+          name: 1Remote-${{ env.BuildVersion }}-net9-x64
           path: Ui/bin/Release/net9.0-windows/publish/win-x64
 
-      # Publish the application net9 self-contained
-      - name: Publish x64-net90-self-contained
+      - name: Publish net9 self-contained
         if: ${{ (inputs.tfm == 'all' || inputs.tfm == 'net9') && inputs.self_contained == true }}
         run: dotnet publish $env:Main_Project -p:PublishProfile=./Ui/Properties/PublishProfiles/x64-net90-self-contained.pubxml
-      # artifact
       - uses: actions/upload-artifact@v4
         if: ${{ (inputs.tfm == 'all' || inputs.tfm == 'net9') && inputs.self_contained == true }}
         with:
-          name: 1Remote-${{env.BuildVersion}}-net9-x64-self-contained
+          name: 1Remote-${{ env.BuildVersion }}-net9-x64-self-contained
           path: Ui/bin/Release/net9.0-windows-self-contained/publish/win-x64
 
-      # Publish the application net10
-      - name: Publish the application net10
+      - name: Publish net10
         if: ${{ inputs.tfm == 'all' || inputs.tfm == 'net10' }}
         run: dotnet publish $env:Main_Project -p:PublishProfile=./Ui/Properties/PublishProfiles/x64-net100.pubxml
-      # artifact
       - uses: actions/upload-artifact@v4
         if: ${{ inputs.tfm == 'all' || inputs.tfm == 'net10' }}
         with:
-          name: 1Remote-${{env.BuildVersion}}-net10-x64
+          name: 1Remote-${{ env.BuildVersion }}-net10-x64
           path: Ui/bin/Release/net10.0-windows/publish/win-x64
 
-      # Publish the application net10 self-contained
-      - name: Publish x64-net100-self-contained
+      - name: Publish net10 self-contained
         if: ${{ (inputs.tfm == 'all' || inputs.tfm == 'net10') && inputs.self_contained == true }}
         run: dotnet publish $env:Main_Project -p:PublishProfile=./Ui/Properties/PublishProfiles/x64-net100-self-contained.pubxml
-      # artifact
       - uses: actions/upload-artifact@v4
         if: ${{ (inputs.tfm == 'all' || inputs.tfm == 'net10') && inputs.self_contained == true }}
         with:
-          name: 1Remote-${{env.BuildVersion}}-net10-x64-self-contained
+          name: 1Remote-${{ env.BuildVersion }}-net10-x64-self-contained
           path: Ui/bin/Release/net10.0-windows-self-contained/publish/win-x64
 
-      # Publish the application net11
-      - name: Publish the application net11
+      - name: Publish net11
         if: ${{ inputs.tfm == 'all' || inputs.tfm == 'net11' }}
         run: dotnet publish $env:Main_Project -p:PublishProfile=./Ui/Properties/PublishProfiles/x64-net110.pubxml
-      # artifact
       - uses: actions/upload-artifact@v4
         if: ${{ inputs.tfm == 'all' || inputs.tfm == 'net11' }}
         with:
-          name: 1Remote-${{env.BuildVersion}}-net11-x64
+          name: 1Remote-${{ env.BuildVersion }}-net11-x64
           path: Ui/bin/Release/net11.0-windows/publish/win-x64
 
-      # Publish the application net11 self-contained
-      - name: Publish x64-net110-self-contained
+      - name: Publish net11 self-contained
         if: ${{ (inputs.tfm == 'all' || inputs.tfm == 'net11') && inputs.self_contained == true }}
         run: dotnet publish $env:Main_Project -p:PublishProfile=./Ui/Properties/PublishProfiles/x64-net110-self-contained.pubxml
-      # artifact
       - uses: actions/upload-artifact@v4
         if: ${{ (inputs.tfm == 'all' || inputs.tfm == 'net11') && inputs.self_contained == true }}
         with:
-          name: 1Remote-${{env.BuildVersion}}-net11-x64-self-contained
+          name: 1Remote-${{ env.BuildVersion }}-net11-x64-self-contained
           path: Ui/bin/Release/net11.0-windows-self-contained/publish/win-x64
-
